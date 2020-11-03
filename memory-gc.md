@@ -647,43 +647,705 @@ Golang内存分配是个相当复杂的过程，其中还掺杂了GC的处理，
 
 
 
+# ==---GC---==
+
+- <font color=red size=5x>go采用标记清除、三色抽象、并发收集器、混合写屏障、辅助gc</font>
+- <font color=red size=5x></font>
+- <font color=red size=5x></font>
+- <font color=red size=5x></font>
+
+# ==---垃圾回收算法---==
+
+业界常见的垃圾回收算法有以下几种：
+
+- 引用计数：对每个对象维护一个引用计数，当引用该对象的对象被销毁时，引用计数减1，当引用计数器为0是回收该对象。
+  - 优点：对象可以很快的被回收，不会出现内存耗尽或达到某个阀值时才回收。
+  - 缺点：不能很好的处理循环引用，而且实时维护引用计数，有也一定的代价。
+  - 代表语言：Python、PHP、Swift
+- 标记-清除：从根变量开始遍历所有引用的对象，引用的对象标记为”被引用”，没有被标记的进行回收。
+  - 优点：解决了引用计数的缺点。
+  - 缺点：需要STW，即要暂时停掉程序运行。
+  - 代表语言：Golang(其采用三色标记法)
+- 分代收集：按照对象生命周期长短划分不同的代空间，生命周期长的放入老年代，而短的放入新生代，不同代有不能的回收算法和回收频率。
+  - 优点：回收性能好
+  - 缺点：算法复杂
+  - 代表语言： JAVA
+
+# 标记清除go
+
+标记清除（Mark-Sweep）算法是最常见的垃圾收集算法，标记清除收集器是跟踪式垃圾收集器，其执行过程可以分成标记（Mark）和清除（Sweep）两个阶段：
+
+1. 标记阶段 — 从根对象出发查找并标记堆中所有存活的对象；
+2. 清除阶段 — 遍历堆中的全部对象，回收未被标记的垃圾对象并将回收的内存加入空闲链表；
+
+如下图所示，内存空间中包含多个对象，我们从根对象出发依次遍历对象的子对象并将从根节点可达的对象都标记成存活状态，即 A、C 和 D 三个对象，剩余的 B、E 和 F 三个对象因为从根节点不可达，所以会被当做垃圾：
+
+![mark-sweep-mark-phase](memory-gc.assets/10a155d6de9d51a69c43cb0137afb4d5.png)
+
+**标记清除的标记阶段**
+
+标记阶段结束后会进入清除阶段，在该阶段中收集器会依次遍历堆中的所有对象，释放其中没有被标记的 B、E 和 F 三个对象并将新的空闲内存空间以链表的结构串联起来，方便内存分配器的使用。
+
+![mark-sweep-sweep-phase](memory-gc.assets/03ffdfb795eb6860ea831198dbebe37b.png)
+
+**标记清除的清除阶段**
+
+这里介绍的是最传统的标记清除算法，垃圾收集器从垃圾收集的根对象出发，递归遍历这些对象指向的子对象并将所有可达的对象标记成存活；标记阶段结束后，垃圾收集器会依次遍历堆中的对象并清除其中的垃圾，整个过程需要标记对象的存活状态，用户程序在垃圾收集的过程中也不能执行，我们需要用到更复杂的机制来解决 STW 的问题。
+
+# 三色抽象
+
+为了解决原始标记清除算法带来的长时间 STW，多数现代的追踪式垃圾收集器都会实现三色标记算法的变种以缩短 STW 的时间。三色标记算法将程序中的对象分成白色、黑色和灰色三类[4](https://www.bookstack.cn/read/draveness-golang/30cd28c181a56e61.md#fn:4)：
+
+- 白色对象 — 潜在的垃圾，其内存可能会被垃圾收集器回收；
+- 黑色对象 — 活跃的对象，包括不存在任何引用外部指针的对象以及从根对象可达的对象；
+- 灰色对象 — 活跃的对象，因为存在指向白色对象的外部指针，垃圾收集器会扫描这些对象的子对象；
+
+![tri-color-objects](memory-gc.assets/5216025cdedb718e38afe958289bacfc.png)
+
+**三色的对象**
+
+在垃圾收集器开始工作时，程序中不存在任何的黑色对象，垃圾收集的根对象会被标记成灰色，垃圾收集器只会从灰色对象集合中取出对象开始扫描，当灰色集合中不存在任何对象时，标记阶段就会结束。
+
+![tri-color-mark-sweep](memory-gc.assets/62df4576106ab67c51bbcf556940bf40.png)
+
+**三色标记垃圾收集器的执行过程**
+
+三色标记垃圾收集器的工作原理很简单，我们可以将其归纳成以下几个步骤：
+
+1. 从灰色对象的集合中选择一个灰色对象并将其标记成黑色；
+2. 将黑色对象指向的所有对象都标记成灰色，保证该对象和被该对象引用的对象都不会被回收；
+3. 重复上述两个步骤直到对象图中不存在灰色对象；
+
+==当三色的标记清除的标记阶段结束之后，应用程序的堆中就不存在任何的灰色对象，我们只能看到黑色的存活对象以及白色的垃圾对象==，垃圾收集器可以回收这些白色的垃圾，下面是使用三色标记垃圾收集器执行标记后的堆内存，堆中只有对象 D 为待回收的垃圾：
+
+![tri-color-mark-sweep-after-mark-phase](memory-gc.assets/03f3870ca48bf142071180a7c47b2844.png)
+
+**三色标记后的堆**
+
+因为用户程序可能在标记执行的过程中修改对象的指针，所以三色标记清除算法本身是不可以并发或者增量执行的，它仍然需要 STW，在如下所示的三色标记过程中，用户程序建立了从 A 对象到 D 对象的引用，但是因为程序中已经不存在灰色对象了，所以 D 对象会被垃圾收集器错误地回收。
+
+![tri-color-mark-sweep-and-mutator](memory-gc.assets/8c8ec851ea65ae47f0123ef64ae34001.png)
+
+**三色标记与用户程序**
+
+本来不应该被回收的对象却被回收了，这在内存管理中是非常严重的错误，我们将这种错误成为<font color=red size=5x>悬挂指针，即指针没有指向特定类型的合法对象，影响了内存的安全性</font>，想要并发或者增量地标记对象还是需要使用屏障技术。
+
+# 屏障技术
+
+内存屏障技术是一种屏障指令，它可以让 CPU 或者编译器在执行内存相关操作时遵循特定的约束，目前的多数的现代处理器都会乱序执行指令以最大化性能，但是该技术能够保证代码对内存操作的顺序性，在内存屏障前执行的操作一定会先于内存屏障后执行的操作[6](https://www.bookstack.cn/read/draveness-golang/30cd28c181a56e61.md#fn:6)。
+
+想要在并发或者增量的标记算法中保证正确性，我们需要达成以下两种三色不变性（Tri-color invariant）中的任意一种：
+
+- <font color=red size=5x>强三色不变性 — 黑色对象不会指向白色对象，只会指向灰色对象或者黑色对象；</font>
+- <font color=red size=5x>弱三色不变性 — 黑色对象指向的白色对象必须包含一条从灰色对象经由多个白色对象的可达路径[7](https://www.bookstack.cn/read/draveness-golang/30cd28c181a56e61.md#fn:7)；</font>
+
+![strong-weak-tricolor-invariant](https://static.bookstack.cn/projects/draveness-golang/f925dcefa05b7cf6534bbcc521d2fd48.png)
+
+**三色不变性**
+
+上图分别展示了遵循强三色不变性和弱三色不变性的堆内存，遵循上述两个不变性中的任意一个，我们都能保证垃圾收集算法的正确性，而屏障技术就是在并发或者增量标记过程中保证三色不变性的重要技术。
+
+垃圾收集中的屏障技术更像是一个钩子方法，它是在用户程序读取对象、创建新对象以及更新对象指针时执行的一段代码，根据操作类型的不同，我们可以将它们分成读屏障（Read barrier）和写屏障（Write barrier）两种，因为读屏障需要在读操作中加入代码片段，对用户程序的性能影响很大，所以编程语言往往都会采用写屏障保证三色不变性。
+
+我们在这里想要介绍的是 Go 语言中使用的两种写屏障技术，分别是 Dijkstra 提出的插入写屏障[8](https://www.bookstack.cn/read/draveness-golang/30cd28c181a56e61.md#fn:8)和 Yuasa 提出的删除写屏障[9](https://www.bookstack.cn/read/draveness-golang/30cd28c181a56e61.md#fn:9)，这里会分析它们如何保证三色不变性和垃圾收集器的正确性。
+
+# 插入写屏障
+
+- <font color=red size=5x>插入写屏障就是在Gc期间新生成的对象,先标记为灰色,第二轮在清理,防止造成`悬挂指针`</font>
+
+  
+
+Dijkstra 在 1978 年提出了插入写屏障，通过如下所示的写屏障，用户程序和垃圾收集器可以在交替工作的情况下保证程序执行的正确性：
+
+```
+writePointer(slot, ptr):
+    shade(ptr)
+    *field = ptr
+```
+
+上述插入写屏障的伪代码非常好理解，每当我们执行类似 `*slot = ptr` 的表达式时，我们会执行上述写屏障通过 `shade` 函数尝试改变指针的颜色。如果 `ptr` 指针是白色的，那么该函数会将该对象设置成灰色，其他情况则保持不变。
+
+![dijkstra-insert-write-barrier](memory-gc.assets/f0cf64ac04bef45614e5b2492f2071f3.png)
+
+**Dijkstra 插入写屏障**
+
+假设我们在应用程序中使用 Dijkstra 提出的插入写屏障，在一个垃圾收集器和用户程序交替运行的场景中会出现如上图所示的标记过程：
+
+1. 垃圾收集器将根对象指向 A 对象标记成黑色并将 A 对象指向的对象 B 标记成灰色；
+2. 用户程序修改 A 对象的指针，将原本指向 B 对象的指针指向 C 对象，这时触发写屏障将 C 对象标记成灰色；
+3. 垃圾收集器依次遍历程序中的其他灰色对象，将它们分别标记成黑色；
+
+Dijkstra 的插入写屏障是一种相对保守的屏障技术，它会将**有存活可能的对象都标记成灰色**以满足强三色不变性。在如上所示的垃圾收集过程中，实际上不再存活的 B 对象最后没有被回收；而如果我们在第二和第三步之间将指向 C 对象的指针改回指向 B，垃圾收集器仍然认为 C 对象是存活的，这些被错误标记的垃圾对象只有在下一个循环才会被回收。
+
+<font color=red size=5x>==插入式的 Dijkstra 写屏障虽然实现非常简单并且也能保证强三色不变性，但是它也有很明显的缺点。因为栈上的对象在垃圾收集中也会被认为是根对象，所以为了保证内存的安全，Dijkstra 必须为栈上的对象增加写屏障或者在标记阶段完成重新对栈上的对象对象进行扫描，这两种方法各有各的缺点，前者会大幅度增加写入指针的额外开销，后者重新扫描栈对象时需要暂停程序，垃圾收集算法的设计者需要在这两者之前做出权衡。==</font>
+
+# 删除写屏障
+
+Yuasa 在 1990 年的论文 Real-time garbage collection on general-purpose machines 中提出了删除写屏障，因为一旦该写屏障开始工作，它就会保证开启写屏障时堆上所有对象的可达，所以也被称作快照垃圾收集（Snapshot GC）[10](https://www.bookstack.cn/read/draveness-golang/30cd28c181a56e61.md#fn:10)：
+
+> This guarantees that no objects will become unreachable to the garbage collector traversal all objects which are live at the beginning of garbage collection will be reached even if the pointers to them are overwritten.
+
+该算法会使用如下所示的写屏障保证增量或者并发执行垃圾收集时程序的正确性：
+
+```
+writePointer(slot, ptr)
+    shade(*slot)
+    *slot = ptr
+```
+
+<font color=red size=5x>上述代码会在老对象的引用被删除时，将白色的老对象涂成灰色，这样删除写屏障就可以保证弱三色不变性，老对象引用的下游对象一定可以被灰色对象引用。</font>
+
+![yuasa-delete-write-barrier](memory-gc.assets/c4cfc632506ff63ad90d3bf0d96941cc.png)
+
+**Yuasa 删除写屏障**
+
+假设我们在应用程序中使用 Yuasa 提出的删除写屏障，在一个垃圾收集器和用户程序交替运行的场景中会出现如上图所示的标记过程：
+
+1. 垃圾收集器将根对象指向 A 对象标记成黑色并将 A 对象指向的对象 B 标记成灰色；
+2. 用户程序将 A 对象原本指向 B 的指针指向 C，触发删除写屏障，但是因为 B 对象已经是灰色的，所以不做改变；
+3. **用户程序将 B 对象原本指向 C 的指针删除，触发删除写屏障，白色的 C 对象被涂成灰色**；
+4. 垃圾收集器依次遍历程序中的其他灰色对象，将它们分别标记成黑色；
+
+上述过程中的第三步触发了 Yuasa 删除写屏障的着色，因为用户程序删除了 B 指向 C 对象的指针，所以 C 和 D 两个对象会分别违反强三色不变性和弱三色不变性：
+
+- 强三色不变性 — 黑色的 A 对象直接指向白色的 C 对象；
+- 弱三色不变性 — 垃圾收集器无法从某个灰色对象出发，经过几个连续的白色对象访问白色的 C 和 D 两个对象；
+
+Yuasa 删除写屏障通过对 C 对象的着色，保证了 C 对象和下游的 D 对象能够在这一次垃圾收集的循环中存活，避免发生悬挂指针以保证用户程序的正确性。
+
+# 增量和并发
+
+传统的垃圾收集算法会在垃圾收集的执行期间暂停应用程序，一旦触发垃圾收集，垃圾收集器就会抢占 CPU 的使用权占据大量的计算资源以完成标记和清除工作，然而很多追求实时的应用程序无法接受长时间的 STW。
+
+![stop-the-world-collector](memory-gc.assets/c3e0754f136f9d8cfc0a99cfb37360cf.png)
+
+**垃圾收集与暂停程序**
+
+- 增量垃圾收集 — 增量地标记和清除垃圾，降低应用程序暂停的最长时间；
+- 并发垃圾收集 — 利用多核的计算资源，在用户程序执行时并发标记和清除垃圾；
+
+因为增量和并发两种方式都可以与用户程序交替运行，所以我们需要**使用屏障技术**保证垃圾收集的正确性；与此同时，应用程序也不能等到内存溢出时触发垃圾收集，因为当内存不足时，应用程序已经无法分配内存，这与直接暂停程序没有什么区别，增量和并发的垃圾收集需要提前触发并在内存不足前完成整个循环，避免程序的长时间暂停。
+
+# 增量收集器
+
+增量式（Incremental）的垃圾收集是减少程序最长暂停时间的一种方案，它可以将原本时间较长的暂停时间切分成多个更小的 GC 时间片，虽然从垃圾收集开始到结束的时间更长了，但是这也减少了应用程序暂停的最大时间：
+
+![incremental-collector](memory-gc.assets/bf4b484a17f79df115b541838609502c.png)
+
+<font color=red size=5x>需要注意的是，`增量式的垃圾收集需要与三色标记法一起使用，为了保证垃圾收集的正确性`，==我们需要在垃圾收集开始前打开写屏障，这样用户程序对内存的修改都会先经过写屏障的处理，保证了堆内存中对象关系的强三色不变性或者弱三色不变性==。虽然增量式的垃圾收集能够==减少最大的程序暂停时间==，但是==增量式收集也会增加一次 GC 循环的总时间，在垃圾收集期间，因为写屏障的影响用户程序也需要承担额外的计算开销，所以增量式的垃圾收集也不是只有优点的。==</font>
+
+# 并发收集器 -go的选择
+
+并发（Concurrent）的垃圾收集不仅能够减少程序的最长暂停时间，还能减少整个垃圾收集阶段的时间，通过开启读写屏障、**利用多核优势与用户程序并行执行**，并发垃圾收集器确实能够减少垃圾收集对应用程序的影响：
+
+![concurrent-collector](memory-gc.assets/fa728b5bd7333cbe3fa5dfc1b3ae7836.png)
+
+**并发垃圾收集器**
+
+虽然并发收集器能够与用户程序一起运行，但是并不是所有阶段都可以与用户程序一起运行，部分阶段还是需要暂停用户程序的，不过与传统的算法相比，并发的垃圾收集可以将能够并发执行的工作尽量并发执行；当然，因为读写屏障的引入，并发的垃圾收集器也一定会带来额外开销，不仅会增加垃圾收集的总时间，还会影响用户程序，这是我们在设计垃圾收集策略时必须要注意的。
 
 
 
+# GC历史
+
+Go 语言的垃圾收集器从诞生的第一天起就一直在演进，除了少数几个版本没有大更新之外，几乎每次发布的小版本都会提升垃圾收集的性能，而与性能一同提升的还有垃圾收集器代码的复杂度，本节将从 Go 语言 v1.0 版本开始分析垃圾收集器的演进过程。
+
+1. [v1.0](https://github.com/golang/go/blob/go1.0.1/src/pkg/runtime/mgc0.c#L882) — 完全串行的标记和清除过程，需要暂停整个程序；
+
+2. v1.1](https://github.com/golang/go/blob/go1.1/src/pkg/runtime/mgc0.c#L1938) — 在多核主机并行执行垃圾收集的标记和清除阶段[11](https://www.bookstack.cn/read/draveness-golang/30cd28c181a56e61.md#fn:11)；
+
+3. v1.3
+
+    — 运行时基于只有指针类型的值包含指针的假设增加了对栈内存的精确扫描支持，实现了真正精确的垃圾收集；
+
+   - 将 `unsafe.Pointer` 类型转换成整数类型的值认定为不合法的，可能会造成悬挂指针等严重问题；
+
+4. v1.5
+
+    — 实现了基于三色标记清扫的并发垃圾收集器；
+
+   - 大幅度降低垃圾收集的延迟从几百 ms 降低至 10ms 以下；
+   - 计算垃圾收集启动的合适时间并通过并发加速垃圾收集的过程；
+
+5. v1.6
+
+    — 实现了去中心化的垃圾收集协调器；
+
+   - 基于显式的状态机使得任意 Goroutine 都能触发垃圾收集的状态迁移；
+   - 使用密集的位图替代空闲链表表示的堆内存，降低清除阶段的 CPU 占用；
+
+6. [v1.7](https://github.com/golang/go/blob/go1.7/src/runtime/mgc.go#L884) — 通过**并行栈收缩**将垃圾收集的时间缩短至 2ms 以内；
+
+7. [v1.8](https://github.com/golang/go/blob/go1.8/src/runtime/mgc.go#L930) — 使用**混合写屏障**将垃圾收集的时间缩短至 0.5ms 以内；
+
+8. [v1.9](https://github.com/golang/go/blob/go1.9/src/runtime/mgc.go#L1187) — 彻底移除暂停程序的重新扫描栈的过程；
+
+9. [v1.10](https://github.com/golang/go/blob/go1.10/src/runtime/mgc.go#L1239) — 更新了垃圾收集调频器（Pacer）的实现，分离软硬堆大小的目标；
+
+10. [v1.12](https://github.com/golang/go/blob/go1.12/src/runtime/mgc.go#L1199) — 使用**新的标记终止算法**简化垃圾收集器的几个阶段；
+
+11. [v1.13](https://github.com/golang/go/blob/go1.13/src/runtime/mgc.go#L1200) — 通过新的 Scavenger 解决瞬时内存占用过高的应用程序向操作系统归还内存的问题；
+
+12. [v1.14](https://github.com/golang/go/blob/go1.14/src/runtime/mgc.go#L1221) — 使用全新的页分配器**优化内存分配的速度**；
+
+我们从 Go 语言垃圾收集器的演进能够看到该组件的的实现和算法变得越来越复杂，最开始的垃圾收集器还是不精确的单线程 STW 收集器，但是最新版本的垃圾收集器却支持并发垃圾收集、去中心化协调等特性，我们在这里将介绍与最新版垃圾收集器相关的组件和特性。
+
+# V1.5的并发垃圾收集
+
+Go 语言在 v1.5 中引入了并发的垃圾收集器，该垃圾收集器使用了我们上面提到的三色抽象和写屏障技术保证垃圾收集器执行的正确性，如何实现并发的垃圾收集器在这里就不展开介绍了，我们来了解一些并发垃圾收集器的工作流程。
+
+![golang-concurrent-collector](memory-gc.assets/87d32f297d7c90f7307f4c390b98e3b9.png)
 
 
 
+<font color=red size=5x>Go 语言的并发垃圾收集器会在`扫描对象之前`暂停程序做一些标记对象的准备工作，其中包括`启动后台标记的垃圾收集器`以及`开启写屏障`，==如果在后台执行的垃圾收集器不够快，应用程序申请内存的速度超过预期，运行时就会让申请内存的应用程序辅助完成垃圾收集的扫描阶段，在标记和标记终止阶段结束之后就会进入异步的清理阶段，将不用的内存增量回收。==</font>
 
 
 
+<font color=red size=5x>v1.5 版本实现的并发垃圾收集策略由专门的 Goroutine 负责在处理器之间同步和协调垃圾收集的状态。`当其他的 Goroutine 发现需要触发垃圾收集时，它们需要将该信息通知给负责修改状态的主 Goroutine，然而这个通知的过程会带来一定的延迟，这个延迟的时间窗口很可能是不可控的，用户程序会在这段时间分配界面很多内存空间。`</font>
 
 
 
+#  V1.6
+
+<font color=red size=5x>V1.6 取出了中心化来开始标记和停止标记带来的延迟,每个goroutine都可以来进行标记</font>
+
+v1.6 引入了去中心化的垃圾收集协调机制[22](https://www.bookstack.cn/read/draveness-golang/30cd28c181a56e61.md#fn:22)，将垃圾收集器变成一个显式的状态机，任意的 Goroutine 都可以调用方法触发状态的迁移，常见的状态迁移方法包括以下几个
+
+- [`runtime.gcStart`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1221) — 从 `_GCoff` 转换至 `_GCmark` 阶段，进入并发标记阶段并打开写屏障；
+- [`runtime.gcMarkDone`](https://github.com/golang/go/blob/85e87f9d81c00d38a196c40f3a93477bc4b3294f/src/runtime/mgc.go#L1422) — 如果所有可达对象都已经完成扫描，调用 [`runtime.gcMarkTermination`](https://github.com/golang/go/blob/85e87f9d81c00d38a196c40f3a93477bc4b3294f/src/runtime/mgc.go#L1605)；
+- [`runtime.gcMarkTermination`](https://github.com/golang/go/blob/85e87f9d81c00d38a196c40f3a93477bc4b3294f/src/runtime/mgc.go#L1605) — 从 `_GCmark` 转换 `_GCmarktermination` 阶段，进入标记终止阶段并在完成后进入 `_GCoff`；
+
+上述的三个方法就是在 [runtime: replace GC coordinator with state machine](https://github.com/golang/go/issues/11970) 问题相关的提交中引入的，它们移除了过去中心化的状态迁移过程。
+
+# 回收堆目标
+
+STW 的垃圾收集器虽然需要暂停程序，但是它能够有效地控制堆内存的大小，<font color=blue size=5x>Go 语言运行时的默认配置会在堆内存达到上一次垃圾收集的 2 倍时，触发新一轮的垃圾收集，这个行为可以通过环境变量 `GOGC` 调整，在默认情况下它的值为 100，即增长 100% 的堆内存才会触发 GC。</font>
+
+![**STW 垃圾收集器的垃圾收集时间**](memory-gc.assets/ab17a3d856134b4da56bf954ecda1328.png)
+
+**STW 垃圾收集器的垃圾收集时间**
 
 
 
+因为并发垃圾收集器会与程序一起运行，所以它无法准确的控制堆内存的大小，并发收集器需要在达到目标前触发垃圾收集，这样才能够保证内存大小的可控，并发收集器需要尽可能保证垃圾收集结束时的堆内存与用户配置的 `GOGC` 一致。
+
+![concurrent-garbage-collector-heap](memory-gc.assets/0d4470eb7e5f811174f8359aa79d4beb.png)
+
+**并发收集器的堆内存**
+
+<font color=red size=5x>Go 语言 v1.5 引入并发垃圾收集器的同时使用垃圾收集调步（Pacing）算法计算触发的垃圾收集的最佳时间，确保触发的时间既不会浪费计算资源，也不会超出预期的堆大小。如上图所示，其中==黑色的部分是上一次垃圾收集后标记的堆大小==，==绿色部分是上次垃圾收集结束后新分配的内存==，因为我们使用并发垃圾收集，所以==黄色的部分就是在垃圾收集期间分配的内存==，最后的==红色部分是垃圾收集结束时与目标的差值==，我们希望尽可能减少红色部分内存，降低垃圾收集带来的额外开销以及程序的暂停时间。</font>
+
+垃圾收集调步算法是跟随 v1.5 一同引入的，该算法的目标是优化堆的增长速度和垃圾收集器的 CPU 利用率[23](https://www.bookstack.cn/read/draveness-golang/30cd28c181a56e61.md#fn:23)，而在 v1.10 版本中又对该算法进行了优化，将原有的目的堆大小拆分成了软硬两个目标[24](https://www.bookstack.cn/read/draveness-golang/30cd28c181a56e61.md#fn:24)，因为调整垃圾收集的执行频率涉及较为复杂的公式，对理解垃圾收集原理帮助较为有限，本节就不展开介绍了，感兴趣的读者可以自行阅读。
+
+# 混合写屏障
+
+在 Go 语言 v1.7 版本之前，运行时会使用 Dijkstra 插入写屏障保证强三色不变性，但是运行时并没有在所有的垃圾收集根对象上开启插入写屏障。因为 Go 语言的应用程序可能包含成百上千的 Goroutine，而垃圾收集的根对象一般包括全局变量和栈对象，如果运行时需要在几百个 Goroutine 的栈上都开启写屏障，会带来巨大的额外开销，所以 Go 团队在实现上选择了在标记阶段完成时**暂停程序、将所有栈对象标记为灰色并重新扫描**，在活跃 Goroutine 非常多的程序中，重新扫描的过程需要占用 10 ~ 100ms 的时间。
+
+Go 语言在 v1.8 组合 Dijkstra 插入写屏障和 Yuasa 删除写屏障构成了如下所示的混合写屏障，该写屏障会**将被覆盖的对象标记成灰色并在当前栈没有扫描时将新对象也标记成灰色**：
+
+```
+writePointer(slot, ptr):
+    shade(*slot)
+    if current stack is grey:
+        shade(ptr)
+    *slot = ptr
+```
 
 
 
+# ==实现原理==
+
+<font color=red size=5x>Go 语言的垃圾收集可以分成==清除终止、标记、标记终止和清除==四个不同阶段，它们分别完成了不同的工作</font>
+
+![garbage-collector-phases](memory-gc.assets/fbeae216be218af2efe8db63d4bdae3b.png)
 
 
 
+**垃圾收集的多个阶段**
 
 
 
+1. 清理终止阶段；
+   1. **暂停程序**，所有的处理器在这时会进入安全点（Safe point）；
+   2. 如果当前垃圾收集循环是强制触发的，我们还需要处理还未被清理的内存管理单元；
+2. 标记阶段；
+   1. 将状态切换至 `_GCmark`、开启写屏障、用户程序协助（Mutator Assiste）并将根对象入队；
+   2. 恢复执行程序，标记进程和用于协助的用户程序会开始并发标记内存中的对象，写屏障会将被覆盖的指针和新指针都标记成灰色，而所有新创建的对象都会被直接标记成黑色；
+   3. 开始扫描根对象，包括所有 Goroutine 的栈、全局对象以及不在堆中的运行时数据结构，扫描 Goroutine 栈期间会暂停当前处理器；
+   4. 依次处理灰色队列中的对象，将对象标记成黑色并将它们指向的对象标记成灰色；
+   5. 使用分布式的终止算法检查剩余的工作，发现标记阶段完成后进入标记终止阶段；
+3. 标记终止阶段；
+   1. **暂停程序**、将状态切换至 `_GCmarktermination` 并关闭辅助标记的用户程序；
+   2. 清理处理器上的线程缓存；
+4. 清理阶段；
+   1. 将状态切换至 `_GCoff` 开始清理阶段，初始化清理状态并关闭写屏障；
+   2. 恢复用户程序，所有新创建的对象会标记成白色；
+   3. 后台并发清理所有的内存管理单元，当 Goroutine 申请新的内存管理单元时就会触发清理；
+
+运行时虽然只会使用 `_GCoff`、`_GCmark` 和 `_GCmarktermination` 三个状态表示垃圾收集的全部阶段，但是在实现上却复杂很多，本节将按照垃圾收集的不同阶段详细分析其实现原理。
+
+# <x>全局变量🍵</x>
+
+在垃圾收集中有一些比较重要的全局变量，在分析其过程之前，我们会先逐一介绍这些重要的变量，这些变量在垃圾收集的各个阶段中会反复出现，所以理解他们的功能是非常重要的，我们先介绍一些比较简单的变量：
+
+- [`runtime.gcphase`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L250) 是垃圾收集器当前处于的阶段，可能处于 `_GCoff`、`_GCmark` 和 `_GCmarktermination`，Goroutine 在读取或者修改该阶段时需要保证原子性；
+- [`runtime.gcBlackenEnabled`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L267) 是一个布尔值，当垃圾收集处于标记阶段时，该变量会被置为 1，在这里辅助垃圾收集的用户程序和后台标记的任务可以将对象涂黑；
+- [`runtime.gcController`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L333) 实现了垃圾收集的调步算法，它能够决定触发并行垃圾收集的时间和待处理的工作；
+- [`runtime.gcpercent`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L170) 是触发垃圾收集的内存增长百分比，默认情况下为 100，即堆内存相比上次垃圾收集增长 100% 时应该触发 GC，并行的垃圾收集器会在到达该目标前完成垃圾收集；
+- [`runtime.writeBarrier`](https://github.com/golang/go/blob/2b920cba8fa68f8ded28150ec1b1a5cea61ae0f0/src/runtime/mgc.go#L256) 是一个包含写屏障状态的结构体，其中的 `enabled` 字段表示写屏障的开启与关闭；
+- [`runtime.worldsema`](https://github.com/golang/go/blob/3093959ee10f5c28211094e784c954f6a304b9c9/src/runtime/proc.go#L876) 是全局的信号量，获取该信号量的线程有权利暂停当前应用程序；
+
+除了上述全局的变量之外，我们在这里还需要简单了解一下 [`runtime.work`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L937) 变量：
+
+```
+var work struct {
+    full  lfstack
+    empty lfstack
+    pad0  cpu.CacheLinePad
+    wbufSpans struct {
+        lock mutex
+        free mSpanList
+        busy mSpanList
+    }
+    ...
+    nproc  uint32
+    tstart int64
+    nwait  uint32
+    ndone  uint32
+    ...
+    mode gcMode
+    cycles uint32
+    ...
+    stwprocs, maxprocs int32
+    ...
+}
+```
+
+该结构体中包含大量垃圾收集的相关字段，例如：表示完成的垃圾收集循环的次数、当前循环时间和 CPU 的利用率、垃圾收集的模式等等，我们会在后面的小节中见到该结构体中的更多的字段。
+
+# 触发时机
+
+- <font color=red size=5x>第一种,后台触发,后台有检测机制,默认是2分钟会检测一次,复合条件就会出发GC</font>
+
+- <font color=red size=5x>第二种,手动触发,当执行runtime.GC的时候,会触发GC</font>
+
+- <font color=red size=5x>第三种,是申请内存,在==堆中==申请小对象,或者直接申请>32kb的大对象的时候,触发GC</font>
+
+  
+
+运行时会通过如下所示的 [`runtime.gcTrigger.test`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1191) 方法决定是否需要触发垃圾收集，当满足触发垃圾收集的基本条件时 — 允许垃圾收集、程序没有崩溃并且没有处于垃圾收集循环，该方法会根据三种不同的方式触发进行不同的检查：
+
+```
+func (t gcTrigger) test() bool {
+    if !memstats.enablegc || panicking != 0 || gcphase != _GCoff {
+        return false
+    }
+    switch t.kind {
+    case gcTriggerHeap:
+        return memstats.heap_live >= memstats.gc_trigger
+    case gcTriggerTime:
+        if gcpercent < 0 {
+            return false
+        }
+        lastgc := int64(atomic.Load64(&memstats.last_gc_nanotime))
+        return lastgc != 0 && t.now-lastgc > forcegcperiod
+    case gcTriggerCycle:
+        return int32(t.n-work.cycles) > 0
+    }
+    return true
+}
+```
+
+1. `gcTriggerHeap` — 堆内存的分配达到达控制器计算的触发堆大小；
+2. `gcTriggerTime` — 如果一定时间内没有触发，就会触发新的循环，该出发条件由 [`runtime.forcegcperiod`](https://github.com/golang/go/blob/3093959ee10f5c28211094e784c954f6a304b9c9/src/runtime/proc.go#L4445) 变量控制，默认为 2 分钟；
+3. `gcTriggerCycle` — 如果当前没有开启垃圾收集，则触发新的循环；
+
+用于开启垃圾收集的方法 [`runtime.gcStart`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1221) 会接收一个 [`runtime.gcTrigger`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1163) 类型的谓词，我们可以根据这个触发 `_GCoff` 退出的结构体找到所有触发的垃圾收集的代码：
+
+- [`runtime.sysmon`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/proc.go#L4455) 和 [`runtime.forcegchelper`](https://github.com/golang/go/blob/3093959ee10f5c28211094e784c954f6a304b9c9/src/runtime/proc.go#L246) — 后台运行定时检查和垃圾收集；
+- [`runtime.GC`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1055) — 用户程序手动触发垃圾收集；
+- [`runtime.mallocgc`](https://github.com/golang/go/blob/921ceadd2997f2c0267455e13f909df044234805/src/runtime/malloc.go#L891) — 申请内存时根据堆大小触发垃圾收集；
+
+![garbage-collector-trigger](memory-gc.assets/7d2b01a85da798bee728b74ae3c9ccd0.png)
+
+**垃圾收集的触发**
+
+## 后台触发
+
+运行时会在应用程序启动时在后台开启一个用于强制触发垃圾收集的 Goroutine，该 Goroutine 的职责非常简单 — 调用 [`runtime.gcStart`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1221) 方法尝试启动新一轮的垃圾收集：
+
+```
+ func init() {
+    go forcegchelper()
+}
+func forcegchelper() {
+    forcegc.g = getg()
+    for {
+        lock(&forcegc.lock)
+        atomic.Store(&forcegc.idle, 1)
+        goparkunlock(&forcegc.lock, waitReasonForceGGIdle, traceEvGoBlock, 1)
+        gcStart(gcTrigger{kind: gcTriggerTime, now: nanotime()})
+    }
+}
+```
+
+为了减少对计算资源的占用，该 Goroutine 会在循环中调用 [`runtime.goparkunlock`](https://github.com/golang/go/blob/cfe3cd903f018dec3cb5997d53b1744df4e53909/src/runtime/proc.go#L309) 主动陷入休眠等待其他 Goroutine 的唤醒，[`runtime.forcegchelper`](https://github.com/golang/go/blob/3093959ee10f5c28211094e784c954f6a304b9c9/src/runtime/proc.go#L246) 在大多数时间都是陷入休眠的，但是它会被系统监控器 [`runtime.sysmon`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/proc.go#L4455) 在满足垃圾收集条件时唤醒：
+
+```
+ func sysmon() {
+    ...
+    for {
+        ...
+        if t := (gcTrigger{kind: gcTriggerTime, now: now}); t.test() && atomic.Load(&forcegc.idle) != 0 {
+            lock(&forcegc.lock)
+            forcegc.idle = 0
+            var list gList
+            list.push(forcegc.g)
+            injectglist(&list)
+            unlock(&forcegc.lock)
+        }
+    }
+}
+```
+
+系统监控在每个循环中都会主动构建一个 [`runtime.gcTrigger`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1163) 并检查垃圾收集的触发条件是否满足，如果满足条件，系统监控会将 [`runtime.forcegc`](https://github.com/golang/go/blob/3093959ee10f5c28211094e784c954f6a304b9c9/src/runtime/runtime2.go#L1011) 状态中持有的 Goroutine 加入全局队列等待调度器的调度。
+
+## 手动触发
+
+用户程序会通过 [`runtime.GC`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1055) 函数在程序运行期间主动通知运行时执行，该方法在调用时会阻塞调用方知道当前垃圾收集循环完成，在垃圾收集期间也可能会通过 STW 暂停整个程序：
+
+```
+func GC() {
+    n := atomic.Load(&work.cycles)
+    gcWaitOnMark(n)
+    gcStart(gcTrigger{kind: gcTriggerCycle, n: n + 1})
+    gcWaitOnMark(n + 1)
+    for atomic.Load(&work.cycles) == n+1 && sweepone() != ^uintptr(0) {
+        sweep.nbgsweep++
+        Gosched()
+    }
+    for atomic.Load(&work.cycles) == n+1 && atomic.Load(&mheap_.sweepers) != 0 {
+        Gosched()
+    }
+    mp := acquirem()
+    cycle := atomic.Load(&work.cycles)
+    if cycle == n+1 || (gcphase == _GCmark && cycle == n+2) {
+        mProf_PostSweep()
+    }
+    releasem(mp)
+}
+```
 
 
 
+1. 在正式开始垃圾收集前，运行时需要通过 [`runtime.gcWaitOnMark`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1130) 函数等待上一个循环的标记终止、标记和标记终止阶段完成；
+2. 调用 [`runtime.gcStart`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1221) 触发新一轮的垃圾收集并通过 [`runtime.gcWaitOnMark`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1130) 等待该轮垃圾收集的标记终止阶段正常结束；
+3. 持续调用 [`runtime.sweepone`](https://github.com/golang/go/blob/85a8526a7e8d12a31f2f1d9ebcec2841a27dc493/src/runtime/mgcsweep.go#L95) 清理全部待处理的内存管理单元并等待所有的清理工作完成，等待期间会调用 [`runtime.Gosched`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/proc.go#L267) 让出处理器；
+4. 完成本轮垃圾收集的清理工作后，通过 [`runtime.mProf_PostSweep`](https://github.com/golang/go/blob/873bd47dfb34ba4416d4df30180905250b91f137/src/runtime/mprof.go) 将该阶段的堆内存状态快照发布出来，我们可以获取这时的内存状态；
+
+手动触发垃圾收集的过程不是特别常见，一般只会在运行时的测试代码中才会出现，不过如果我们认为触发主动垃圾收集是有必要的，我们也可以直接调用该方法，但是并不认为这是一种推荐的做法。
 
 
 
+## 申请内存
+
+最后一个可能会触发垃圾收集的就是 [`runtime.mallocgc`](https://github.com/golang/go/blob/921ceadd2997f2c0267455e13f909df044234805/src/runtime/malloc.go#L891) 函数了，我们在上一节内存分配器中曾经介绍过运行时会将堆上的对象按大小分成微对象、小对象和大对象三类，这三类对象的创建都可能会触发新的垃圾收集循环：
+
+```
+ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+    shouldhelpgc := false
+    ...
+    if size <= maxSmallSize {
+        if noscan && size < maxTinySize {
+            ...
+            v := nextFreeFast(span)
+            if v == 0 {
+                v, _, shouldhelpgc = c.nextFree(tinySpanClass)
+            }
+            ...
+        } else {
+            ...
+            v := nextFreeFast(span)
+            if v == 0 {
+                v, span, shouldhelpgc = c.nextFree(spc)
+            }
+          ...
+        }
+    } else {
+        shouldhelpgc = true
+        ...
+    }
+    ...
+    if shouldhelpgc {
+        if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
+            gcStart(t)
+        }
+    }
+    return x
+}
+```
+
+1. 当前线程的内存管理单元中不存在空闲空间时，创建微对象和小对象需要调用 [`runtime.mcache.nextFree`](https://github.com/golang/go/blob/921ceadd2997f2c0267455e13f909df044234805/src/runtime/malloc.go#L858) 方法从中心缓存或者页堆中获取新的管理单元，在这时就可能触发垃圾收集；
+2. 当用户程序申请分配 32KB 以上的大对象时，一定会构建 [`runtime.gcTrigger`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1163) 结构体尝试触发 垃圾收集；
+
+通过堆内存触发垃圾收集需要比较 [`runtime.mstats`](https://github.com/golang/go/blob/26154f31ad6c801d8bad5ef58df1e9263c6beec7/src/runtime/mstats.go#L24) 中的两个字段 — 表示垃圾收集中存活对象字节数的 `heap_live` 和表示触发标记的堆内存大小的 `gc_trigger`；当内存中存活的对象字节数大于触发垃圾收集的堆大小时，新一轮的垃圾收集就会开始。在这里，我们将分别介绍这两个值的计算过程：
+
+1. `heap_live` — 为了减少锁竞争，运行时只会在中心缓存分配或者释放内存管理单元以及在堆上分配大对象时才会更新；
+2. `gc_trigger` — 在标记终止阶段调用 [`runtime.gcSetTriggerRatio`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L763) 更新触发下一次垃圾收集的堆大小；
+
+[`runtime.gcController`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L333) 会在每个循环结束后计算触发比例并通过 [`runtime.gcSetTriggerRatio`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L763) 设置 `gc_trigger`，它能够决定触发垃圾收集的时间以及用户程序和后台处理的标记任务的多少，利用反馈控制的算法根据堆的增长情况和垃圾收集 CPU 利用率确定触发垃圾收集的时机。
+
+你可以在 [`runtime.gcControllerState.endCycle`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L559) 方法中找到 v1.5 提出的垃圾收集调步算法[26](https://www.bookstack.cn/read/draveness-golang/30cd28c181a56e61.md#fn:26)，并在 [`runtime.gcControllerState.revise`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L488) 方法中找到 v1.10 引入的软硬堆目标分离算法[27](https://www.bookstack.cn/read/draveness-golang/30cd28c181a56e61.md#fn:27)。
 
 
 
+# 垃圾收集启动🍵
 
+垃圾收集在启动过程一定会调用 [`runtime.gcStart`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1221) 函数，虽然该函数的实现比较复杂，但是它的主要职责就是修改全局的垃圾收集状态到 `_GCmark` 并做一些准备工作，我们会分以下几个阶段介绍该函数的实现：
 
+1. 两次调用 [`runtime.gcTrigger.test`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1191) 方法检查是否满足垃圾收集条件；
+2. 暂停程序、在后台启动用于处理标记任务的工作 Goroutine、确定所有内存管理单元都被清理以及其他标记阶段开始前的准备工作；
+3. 进入标记阶段、准备后台的标记工作、根对象的标记工作以及微对象、恢复用户程序，进入并发扫描和标记阶段；
 
+验证垃圾收集条件的同时，该方法还会在循环中不断调用 [`runtime.sweepone`](https://github.com/golang/go/blob/85a8526a7e8d12a31f2f1d9ebcec2841a27dc493/src/runtime/mgcsweep.go#L95) 清理已经被标记的内存单元，完成上一个垃圾收集循环的收尾工作：
 
+```
+func gcStart(trigger gcTrigger) {
+    for trigger.test() && sweepone() != ^uintptr(0) {
+        sweep.nbgsweep++
+    }
+    semacquire(&work.startSema)
+    if !trigger.test() {
+        semrelease(&work.startSema)
+        return
+    }
+    ...
+}
+```
+
+在验证了垃圾收集的条件并完成了收尾工作后，该方法会通过 `semacquire` 获取全局的 `worldsema` 信号量、调用 [`runtime.gcBgMarkStartWorkers`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1808) 启动后台标记任务、在系统栈中调用 [`runtime.stopTheWorldWithSema`](https://github.com/golang/go/blob/3093959ee10f5c28211094e784c954f6a304b9c9/src/runtime/proc.go#L900) 暂停程序并调用 [`runtime.finishsweep_m`](https://github.com/golang/go/blob/3093959ee10f5c28211094e784c954f6a304b9c9/src/runtime/mgcsweep.go#L51) 保证上一个内存单元的正常回收：
+
+```
+func gcStart(trigger gcTrigger) {
+    ...
+    semacquire(&worldsema)
+    gcBgMarkStartWorkers()
+    work.stwprocs, work.maxprocs = gomaxprocs, gomaxprocs
+    ...
+    systemstack(stopTheWorldWithSema)
+    systemstack(func() {
+        finishsweep_m()
+    })
+    work.cycles++
+    gcController.startCycle()
+    ...
+}
+```
+
+除此之外，上述过程还会修改全局变量 [`runtime.work`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L937) 持有的状态，包括垃圾收集需要的 Goroutine 数量以及已完成的循环数。
+
+在完成全部的准备工作后，盖该方法就进入了执行的最后阶段。在该阶段中，我们会修改全局的垃圾收集状态到 `_GCmark` 并依次执行下面的步骤：
+
+1. 调用 [`runtime.gcBgMarkPrepare`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L1822) 函数初始化后台扫描需要的状态；
+2. 调用 [`runtime.gcMarkRootPrepare`](https://github.com/golang/go/blob/cdf3db5df6bdb68f696fb15cc657207efcf778ef/src/runtime/mgcmark.go#L52) 函数扫描栈上、全局变量等根对象并将它们加入队列；
+3. 设置全局变量 [`runtime.gcBlackenEnabled`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/mgc.go#L267)，用户程序和标记任务可以将对象涂黑；
+4. 调用 [`runtime.startTheWorldWithSema`](https://github.com/golang/go/blob/3093959ee10f5c28211094e784c954f6a304b9c9/src/runtime/proc.go#L976) 启动程序，后台任务也会开始标记堆中的对象；
+
+```
+func gcStart(trigger gcTrigger) {
+    ...
+    setGCPhase(_GCmark)
+    gcBgMarkPrepare()
+    gcMarkRootPrepare()
+    atomic.Store(&gcBlackenEnabled, 1)
+    systemstack(func() {
+        now = startTheWorldWithSema(trace.enabled)
+        work.pauseNS += now - work.pauseStart
+        work.tMark = now
+    })
+    semrelease(&work.startSema)
+}
+```
+
+# 暂停与恢复程序
+
+[`runtime.stopTheWorldWithSema`](https://github.com/golang/go/blob/3093959ee10f5c28211094e784c954f6a304b9c9/src/runtime/proc.go#L900) 和 [`runtime.startTheWorldWithSema`](https://github.com/golang/go/blob/3093959ee10f5c28211094e784c954f6a304b9c9/src/runtime/proc.go#L976) 是一对用于暂停和恢复程序的核心函数，它们有着完全相反的功能，但是程序的暂停会比恢复要复杂一些，我们来看一下前者的实现原理：
+
+```
+func stopTheWorldWithSema() {
+    _g_ := getg()
+    sched.stopwait = gomaxprocs
+    atomic.Store(&sched.gcwaiting, 1)
+    preemptall()
+    _g_.m.p.ptr().status = _Pgcstop
+    sched.stopwait--
+    for _, p := range allp {
+        s := p.status
+        if s == _Psyscall && atomic.Cas(&p.status, s, _Pgcstop) {
+            p.syscalltick++
+            sched.stopwait--
+        }
+    }
+    for {
+        p := pidleget()
+        if p == nil {
+            break
+        }
+        p.status = _Pgcstop
+        sched.stopwait--
+    }
+    wait := sched.stopwait > 0
+    if wait {
+        for {
+            if notetsleep(&sched.stopnote, 100*1000) {
+                noteclear(&sched.stopnote)
+                break
+            }
+            preemptall()
+        }
+    }
+}
+```
+
+暂停程序主要使用了 [`runtime.preemptall`](https://github.com/golang/go/blob/26154f31ad6c801d8bad5ef58df1e9263c6beec7/src/runtime/proc.go#L4638) 函数，该函数会调用我们在前面介绍过的 [`runtime.preemptone`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/proc.go#L4666)，因为程序中活跃的最大处理数为 `gomaxprocs`，所以 [`runtime.stopTheWorldWithSema`](https://github.com/golang/go/blob/3093959ee10f5c28211094e784c954f6a304b9c9/src/runtime/proc.go#L900) 在每次发现停止的处理器时都会对该变量减一，直到所有的处理器都停止运行。该函数会依次停止当前处理器、等待处于系统调用的处理器以及获取并抢占空闲的处理器，处理器的状态在该函数返回时都会被更新至 `_Pgcstop`，等待垃圾收集器的重新唤醒。
+
+程序恢复过程会使用 [`runtime.startTheWorldWithSema`](https://github.com/golang/go/blob/3093959ee10f5c28211094e784c954f6a304b9c9/src/runtime/proc.go#L976)，该函数的实现也相对比较简单：
+
+1. 调用 [`runtime.netpoll`](https://github.com/golang/go/blob/cfe2ab42e764d2eea3a3339aac1eaff97520baa0/src/runtime/netpoll_epoll.go#L99) 从网络轮询器中获取待处理的任务并加入全局队列；
+2. 调用 [`runtime.procresize`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/proc.go#L4154) 扩容或者缩容全局的处理器；
+3. 调用 [`runtime.notewakeup`](https://github.com/golang/go/blob/10e7bc994f47a71472c49f84ab782fdfe44bf22e/src/runtime/lock_sema.go#L134) 或者 [`runtime.newm`](https://github.com/golang/go/blob/64c22b70bf00e15615bb17c29f808b55bc339682/src/runtime/proc.go#L1703) 依次唤醒处理器或者为处理器创建新的线程；
+4. 如果当前待处理的 Goroutine 数量过多，创建额外的处理器辅助完成任务；
+
+```
+func startTheWorldWithSema(emitTraceEvent bool) int64 {
+    mp := acquirem()
+    if netpollinited() {
+        list := netpoll(0)
+        injectglist(&list)
+    }
+    procs := gomaxprocs
+    p1 := procresize(procs)
+    sched.gcwaiting = 0
+    ...
+    for p1 != nil {
+        p := p1
+        p1 = p1.link.ptr()
+        if p.m != 0 {
+            mp := p.m.ptr()
+            p.m = 0
+            mp.nextp.set(p)
+            notewakeup(&mp.park)
+        } else {
+            newm(nil, p)
+        }
+    }
+    if atomic.Load(&sched.npidle) != 0 && atomic.Load(&sched.nmspinning) == 0 {
+        wakep()
+    }
+    ...
+}
+```
 
 
 
