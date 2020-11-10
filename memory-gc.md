@@ -1349,13 +1349,32 @@ func startTheWorldWithSema(emitTraceEvent bool) int64 {
 
 
 
+# ==---V1.3的mark标记---==
+
+- <font color=blue>STW暂停 标记不可达对象</font>
+- <font color=blue>清除不可达对象</font>
+- <font color=blue>STW暂停 标记不可达对象</font>
+- <font color=blue>STW暂停 标记不可达对象</font>
 
 
 
+缺点:
 
+​	STW 程序暂停,程序出现卡顿
 
+​	标记整个heap
 
+​	清除数据会产生heap碎片
 
+![image-20201110233427205](memory-gc.assets/image-20201110233427205.png)
+
+![image-20201110232809023](memory-gc.assets/image-20201110232809023.png)
+
+![image-20201110232836755](memory-gc.assets/image-20201110232836755.png)
+
+![image-20201110232924961](memory-gc.assets/image-20201110232924961.png)
+
+![image-20201110233006521](memory-gc.assets/image-20201110233006521.png)
 
 
 
