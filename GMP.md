@@ -296,29 +296,81 @@ runqueue=0 [1 0 0 0 0 0 0 0]  第一个0 全局队列 然后是每个本地队�
 
 <font color=red size=5x>调用G0切换到G3,执行,此时就不是自旋线程了</font>
 
+
+
+
+
+<font color=blue size=5x>全局队列获取的个数`</font>
+
+```
+n = min(len(GQ)/GOMAXPROCS+1,len(GQ/2))
+
+GQ 全局队列G
+```
+
+
+
 ![image-20201215213748944](GMP.assets/image-20201215213748944.png)
 
 
 
+## 8、 M2从M1 偷取后半部分执行
+
+<font color=green size=5x>M2被唤醒之后是自旋线程,全局队列位空</font>
+
+<font color=red size=5x>此时从其他队列偷取一半,的后半部分来到自己的本地队列执行</font>
 
 
 
+![image-20201216205558590](GMP.assets/image-20201216205558590.png)
 
 
 
+## 9、自旋线程的最大限制
+
+<font color=green size=5x>GOMAXPROCESS控制P的数量</font>
+
+<font color=red size=5x>最大的自旋线程数为GOMAXPROCESS-不是自旋的线程数</font>
+
+<font color=red size=5x>其他线程放入休眠线程池中</font>
 
 
 
+![image-20201216210122649](GMP.assets/image-20201216210122649.png)
 
 
 
+## 10、G发生系统调用/阻塞
+
+<font color=green size=5x>当M2发生系统调用或者网络请求阻塞的时候,M2会和P2解绑</font>
+
+<font color=red size=5x>解绑后的P2会寻找是否有空闲的M,如果有,就和其绑定,没有放入空闲P队列中</font>
 
 
 
+![image-20201216211108064](GMP.assets/image-20201216211108064.png)
 
 
 
+## 11、G从阻塞到不阻塞
 
+
+
+<font color=red size=5x>当阻塞的G和M2不阻塞之后,M2必须有P才可以执行G,优先获取P2</font>
+
+<font color=green size=5x>此时P2和P5绑定,那么会从空闲的P队列中获取是否有空空闲的P</font>
+
+<font color=green size=5x>如果没有,那么G会和M2解绑,将G放入全局队列</font>
+
+![image-20201216211542537](GMP.assets/image-20201216211542537.png)
+
+
+
+## 12、休眠队列的回收
+
+
+
+<font color=green size=5x>如果休眠线程队列长期没有被唤醒,就会被GC回收</font>
 
 
 
