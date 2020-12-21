@@ -14,6 +14,34 @@
 
 
 
+
+
+# 线程状态
+
+线程可以有三中状态
+
+<font color=green size=5x>等待中（waiting）</font>
+
+- 这意味着线程停止并等待某件事情以继续，这可能是因为等待硬件（磁盘、网络）、操作系统（系统调用）或异步调用（原子、互斥）等原因，这些类型的延迟是性能下降的根本原因
+
+<font color=green size=5x>待执行（Runnable）</font>
+
+- 这意味着线程需要内核上的时间，以便执行它指定的机器指令。如果有很多线程都需要时间，那么线程需要等待更长的时间才能获得执行。此外，由于更多的线程在竞争，每个线程获得的单个执行时间都会缩短。这种类型的调度延迟也可能导致性能下降。
+
+<font color=green size=5x>执行中（Executing）</font>
+
+- 这意味着线程已经被放置在一个核心上，并且正在执行它的机器指令。与应用程序相关的工作正在完成。这是每个人都想要的。
+
+
+
+# 线程工作状态
+
+线程可以做两种类型的工作。第一个称为 **CPU-Bound**，第二个称为 **IO-Bound**。
+
+<font color=green size=5x>**CPU-Bound**：</font>这种工作类型永远也不会让线程处在等待状态，因为这是一项不断进行计算的工作。比如计算 π 的第 n 位，就是一个 CPU-Bound 线程。
+
+<font color=green size=5x>**IO-Bound**：</font>这是导致线程进入等待状态的工作类型。比如通过网络请求对资源的访问或对操作系统进行系统调用。
+
 # go的协程
 
 ![image-20201122113958774](GMP.assets/image-20201122113958774.png)
@@ -29,6 +57,115 @@
 
 
 ![img](https://img.kancloud.cn/bd/cd/bdcdc5e6fcb03244a9843333cca62378_1292x860.png)
+
+
+
+# 异步网络调用
+
+当系统执行异步的网路调用的时候，会使用<font color=red size=5x>网络轮询器的东西（netpoll）来更有效地处理系统调用</font>,此时，会将G交给网络轮训器来执行
+
+
+
+
+
+# 同步系统调用
+
+M会和P解绑定，M阻塞等G的执行，P在下一个G启动的时候寻找新的M的绑定执行，当此M执行完毕会优先寻找之前绑定的P，如果此时P不处于空闲状态，M查找其他的P，如果没有空闲的P。M会将G放入全局队列，等带执行
+
+![图片描述](GMP/bVbhQWw-20201221154308001.png)
+
+调度器介入后：识别出**`G1`**已导致**`M1`**阻塞，此时，调度器将**`M1`**与**`P`**分离，同时也将**`G1`**带走。然后调度器引入新的**`M2`**来服务**`P`**。此时，可以从 LRQ 中选择**`G2`**并在**`M2`**上进行上下文切换。
+
+![图片描述](GMP/bVbhQX7.png)
+
+阻塞的系统调用完成后：**`G1`**可以移回 LRQ 并再次由**`P`**执行。如果这种情况需要再次发生，M1将被放在旁边以备将来使用。
+
+![图片描述](GMP/bVbhQZA.png)
+
+
+
+# 抢占调度
+
+在`runtime.main`中会创建一个额外m运行`sysmon`函数，抢占就是在sysmon中实现的。
+
+<font color=red size=5x>sysmon会进入一个无限循环, ==第一轮回休眠20us, 之后每次休眠时间倍增, 最终每一轮都会休眠10ms.== sysmon中有netpool(获取fd事件), retake(抢占), forcegc(按时间强制执行gc), scavenge heap(释放自由列表中多余的项减少内存占用)等处理。</font>
+
+## 2、**抢占条件**：
+
+1. 如果 P 在系统调用中，且时长已经过一次 sysmon 后，则抢占；
+
+调用 `handoffp` 解除 M 和 P 的关联。
+
+1. 如果 P 在运行，且时长经过一次 sysmon 后，并且时长超过设置的阻塞时长，则抢占；
+
+设置标识，标识该函数可以被中止，当调用栈识别到这个标识时，就知道这是抢占触发的, 这时会再检查一遍是否要抢占。
+
+# 抢占思想
+
+1. sysmon中定期扫描正在执行的g列表,筛选出执行时间过长的g并且设置需要被抢占的标签.
+2. 在恰当的地方检测被抢占标记,(runtime主动)切换,让出cpu.
+
+
+
+## 1、创建时间
+
+<font color=red size=5x>sysmon不和任何的P绑定，是单独运行，负责G的监控及抢占</font>
+
+sysmon函数是Go runtime启动时创建的，负责监控所有goroutine的状态，判断是否需要GC，进行netpoll等操作。sysmon函数中会调用retake函数进行抢占式调度。
+
+
+
+## 2、抢占周期
+
+关于扫描周期,至少是`20us`一个循环,后面视`idle`循环次数来进行`指数退避`(超过1ms之后倍增),但最长时间不超过`10ms`,故系统至多在`10ms`左右进行一次抢占检测.
+
+<font color=red size=5x>也就是说当sysmon检测到M被阻塞了10ms，就会解绑M和P，然后别的M抢占P进行执行</font>
+
+
+
+## 3、 怎么检测的
+
+<font color=red size=5x>有计数来记录P的调度次数，还会记录上次执行的时间，如果下次检测P调度次数没有增加，则将当前时间更新，然后将P和M绑定，将当前的G和M绑定执行</font>
+
+1. 通过遍历allp列表来获取正在运行的g.
+2. 状态检测.
+
+```
+        t := int64(_p_.schedtick)
+      if int64(pd.schedtick) != t { //在周期内已经调度过,即当前p上运行的g改变过.
+                pd.schedtick = uint32(t)
+                pd.schedwhen = now //更新最近一次抢占检测的时间
+                continue
+            }
+            if pd.schedwhen+forcePreemptNS > now { 
+                continue
+            }
+            preemptone(_p_)
+```
+
+从上面关键数据结构得知 p.schedtick 记录了这个P上总共调度次数(递增), 故`sysmon`通过比较最近一次记录的`schedtick` 即可判断在一个周期内是否发生过调度行为.
+
+通过最近一次检测时间与当前时间比较来明确是否需要抢占标记`pd.schedwhen+forcePreemptNS>now`
+
+`forcePreemptNS`为`10ms` ,如果超过10ms没有调度,则需要抢占, PS:并不能保证一个G最多运行10ms.
+
+最后通过`preemptone`来标记当前G需要被抢占
+
+## 3、抢占触发
+
+`func preemptone` 注释已经说了(runtime的注释很好),抢占触发时机: 目标g进行函数调用中触发栈检测过程中进行.
+
+```
+func testfunc()(sum int){
+    var nums[100] int
+    for _, num := range nums {
+        sum += num
+    }
+    return
+}
+```
+
+
 
 
 
